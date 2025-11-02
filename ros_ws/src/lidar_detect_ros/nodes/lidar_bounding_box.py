@@ -41,8 +41,8 @@ class LidarClusterNode:
     def __init__(self):
         rospy.init_node("lidar_bounding_box_node", anonymous=True)
 
-        self.marker_pub = rospy.Publisher("lidar_bounding_boxes", MarkerArray, queue_size=1)
-        self.cent_pub = rospy.Publisher("/pcl_centroids", PointCloud2, queue_size=1)
+        self.marker_pub = rospy.Publisher("lidar_bounding_boxes", MarkerArray, queue_size=1, latch=True)
+        self.cent_pub = rospy.Publisher("/pcl_centroids", PointCloud2, queue_size=1, latch=True)
 
         # DBSCAN params
         self.eps = rospy.get_param("~dbscan_eps", 1.0)        # fallback eps
@@ -58,15 +58,9 @@ class LidarClusterNode:
         self.plane_dist_thresh = rospy.get_param("~plane_dist_thresh", 0.2)  # D
         self.k_pre_default = rospy.get_param("~k_pre_default", 5)
 
-        # LiDAR angular resolution used for adaptive eps formula (degrees)
-        self.delta_alpha = rospy.get_param("~lidar_horiz_res_deg", 0.16)  # degrees
+        # LiDAR angular resolution used for adaptive eps formula
+        self.delta_alpha = rospy.get_param("~lidar_horiz_res_deg", 0.16)
         self.lambda_eps = rospy.get_param("~lambda_eps", 1.3)
-
-        # (B) RANSAC fallback control (added)
-        self.use_ransac_after_paper = rospy.get_param("~use_ransac_after_paper", False)
-
-        # (C) Core search mode selector (added): "stable" or "improved"
-        self.core_search_mode = rospy.get_param("~core_search_mode", "stable")
 
         # OBB: no params required here; can add if needed
         rospy.Subscriber("/velodyne_points", PointCloud2, self.callback, queue_size=1)
@@ -461,19 +455,6 @@ class LidarClusterNode:
         core_mask[core_indices] = True
         return core_mask, neighbors
 
-    # (C) Added: stable core search without early neighbor removal
-    def _stable_core_search(self, points, eps_array):
-        if points.shape[0] == 0:
-            return np.zeros(0, dtype=bool), []
-        tree = KDTree(points[:, :2])
-        neighbors = tree.query_radius(points[:, :2], r=eps_array, return_distance=False)
-        N = points.shape[0]
-        core_mask = np.zeros(N, dtype=bool)
-        for idx in range(N):
-            if neighbors[idx].shape[0] >= self.min_samples:
-                core_mask[idx] = True
-        return core_mask, neighbors
-
     def _form_and_merge_clusters(self, points, core_mask, neighbors):
         """EXISTING FUNCTION - UNCHANGED"""
         N = points.shape[0]
@@ -605,13 +586,12 @@ class LidarClusterNode:
         mask = dists < max_range
         data = data[mask]
 
-        z_min = rospy.get_param("~z_min", -3.0)
-        z_max = rospy.get_param("~z_max", 3.0)
+        z_min = rospy.get_param("~z_min", -4.0)
+        z_max = rospy.get_param("~z_max", 4.0)
         zmask = (data[:, 2] > z_min) & (data[:, 2] < z_max)
         data = data[zmask]
 
         # Ground segmentation (paper-style)
-        paper_ok = True  # (B) track paper-seg status (added)
         try:
             ground_mask_paper = self._multi_region_ground_segmentation(data)
             removed_by_paper = np.sum(ground_mask_paper)
@@ -620,30 +600,24 @@ class LidarClusterNode:
         except Exception as e:
             rospy.logwarn(f"Paper-style ground segmentation failed: {e}")
             data_nonground = data.copy()
-            paper_ok = False  # (B) mark failure
 
         # RANSAC fallback
         try:
-            # (B) run only if paper failed OR user forces it via param
-            if (not paper_ok) or self.use_ransac_after_paper:
-                X = data_nonground[:, :2]
-                y = data_nonground[:, 2]
-                if X.shape[0] >= 3:
-                    ransac = RANSACRegressor(residual_threshold=0.2, max_trials=100)
-                    ransac.fit(X, y)
-                    inlier_mask = ransac.inlier_mask_
-                    plane_pred = ransac.predict(X)
-                    plane_dist = np.abs(y - plane_pred)
+            X = data_nonground[:, :2]
+            y = data_nonground[:, 2]
+            if X.shape[0] >= 3:
+                ransac = RANSACRegressor(residual_threshold=0.2, max_trials=100)
+                ransac.fit(X, y)
+                inlier_mask = ransac.inlier_mask_
+                plane_pred = ransac.predict(X)
+                plane_dist = np.abs(y - plane_pred)
 
-                    D = 0.2
-                    ground_mask = (plane_dist < D) & inlier_mask
+                D = 0.2
+                ground_mask = (plane_dist < D) & inlier_mask
 
-                    rospy.loginfo_throttle(3, f"RANSAC: candidates={np.sum(inlier_mask)}, removed={np.sum(ground_mask)}")
-                    data = data_nonground[~ground_mask]
-                else:
-                    data = data_nonground
+                rospy.loginfo_throttle(3, f"RANSAC: candidates={np.sum(inlier_mask)}, removed={np.sum(ground_mask)}")
+                data = data_nonground[~ground_mask]
             else:
-                # (B) paper succeeded and user didn't force RANSAC
                 data = data_nonground
         except Exception as e:
             rospy.logwarn(f"RANSAC ground removal skipped due to error: {e}")
@@ -671,13 +645,7 @@ class LidarClusterNode:
                 continue
 
             eps_array = self._adaptive_eps_for_points(sub_pts)
-
-            # original call (kept)
             core_mask_local, neighbors_local = self._improved_core_search(sub_pts, eps_array)
-            # (C) override with stable mode if selected
-            if getattr(self, 'core_search_mode', 'stable') == 'stable':
-                core_mask_local, neighbors_local = self._stable_core_search(sub_pts, eps_array)
-
             local_labels = self._form_and_merge_clusters(sub_pts, core_mask_local, neighbors_local)
 
             unique_local = np.unique(local_labels)
@@ -802,4 +770,3 @@ if __name__ == "__main__":
         rospy.spin()
     except rospy.ROSInterruptException:
         pass
-
