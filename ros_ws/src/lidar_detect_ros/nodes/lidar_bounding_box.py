@@ -41,28 +41,36 @@ class LidarClusterNode:
     def __init__(self):
         rospy.init_node("lidar_bounding_box_node", anonymous=True)
 
+        # Publishers (latched so late subscribers still get the latest)
         self.marker_pub = rospy.Publisher("lidar_bounding_boxes", MarkerArray, queue_size=1, latch=True)
-        self.cent_pub = rospy.Publisher("/pcl_centroids", PointCloud2, queue_size=1, latch=True)
+        self.cent_pub   = rospy.Publisher("/pcl_centroids", PointCloud2, queue_size=1, latch=True)
+
+        # Keep track of last published marker IDs for DELETE
+        self._prev_ids = set()
+        self._marker_ns = "lidar_boxes"  # single namespace for delete reliability
 
         # DBSCAN params
-        self.eps = rospy.get_param("~dbscan_eps", 1.0)        # fallback eps
-        self.min_samples = rospy.get_param("~dbscan_min_samples", 5)  # small-object friendly
+        self.eps = rospy.get_param("~dbscan_eps", 1.0)
+        self.min_samples = rospy.get_param("~dbscan_min_samples", 5)
 
         # Ground segmentation / polar grid params (paper-inspired defaults)
         self.region_bounds = rospy.get_param("~region_bounds", [0.5, 10.0, 30.0, 60.0, 100.0])  # 4 regions
         self.region_grid_counts = rospy.get_param("~region_grid_counts", [[2,8],[8,64],[12,128],[6,64]])
-        self.alpha_h_a = rospy.get_param("~delta_h_a", 0.025)  # paper 'a' in Δh = a*x + b
-        self.alpha_h_b = rospy.get_param("~delta_h_b", -0.05)  # paper 'b'
+        self.alpha_h_a = rospy.get_param("~delta_h_a", 0.025)
+        self.alpha_h_b = rospy.get_param("~delta_h_b", -0.05)
         self.seed_iter_max = rospy.get_param("~seed_iter_max", 5)
         self.ref_normal_angle_thresh = rospy.get_param("~ref_normal_angle_thresh_deg", 3.3)
-        self.plane_dist_thresh = rospy.get_param("~plane_dist_thresh", 0.2)  # D
+        self.plane_dist_thresh = rospy.get_param("~plane_dist_thresh", 0.2)
         self.k_pre_default = rospy.get_param("~k_pre_default", 5)
 
         # LiDAR angular resolution used for adaptive eps formula
         self.delta_alpha = rospy.get_param("~lidar_horiz_res_deg", 0.16)
         self.lambda_eps = rospy.get_param("~lambda_eps", 1.3)
 
-        # OBB: no params required here; can add if needed
+        # Stamp policy: ALWAYS use incoming /velodyne_points stamp for both outputs
+        # (yeh matcher ki sync gating ko stable banata hai)
+        self.use_wall_time = False  # keep for future toggles if needed
+
         rospy.Subscriber("/velodyne_points", PointCloud2, self.callback, queue_size=1)
         rospy.loginfo("LIDAR bounding box node started... (eps=%s min_samples=%s)", self.eps, self.min_samples)
 
@@ -118,11 +126,8 @@ class LidarClusterNode:
                 grid_to_points[gid].append(int(pt_idx))
         return grid_to_points, region_limits
 
-    # -----------------------------
-    # IMPROVED: Complete Heuristic Rules Implementation
-    # -----------------------------
+    # ------------- Heuristics / Ground Segmentation (unchanged) -------------
     def _heuristic_special_point_filter(self, raw_points):
-        """EXISTING FUNCTION - UNCHANGED"""
         N = raw_points.shape[0]
         mask_candidate = np.zeros(N, dtype=bool)
         xy = raw_points[:, :2]
@@ -152,85 +157,57 @@ class LidarClusterNode:
         return mask_candidate
 
     def _adaptive_delta_h(self, distances):
-        """EXISTING FUNCTION - UNCHANGED"""
         return self.alpha_h_a * distances + self.alpha_h_b
 
     def _is_approach_point(self, ordered_idxs, points, delta_h_arr, i_pos):
-        """NEW: Check if current point is an approach point"""
-        if i_pos < 2:  # Need at least 2 previous points
+        if i_pos < 2:
             return False
-            
-        i_global = ordered_idxs[i_pos]
-        z_cur = points[i_global, 2]
-        
-        # Check height differences with previous points
+        z_cur = points[ordered_idxs[i_pos], 2]
         z_prev1 = points[ordered_idxs[i_pos-1], 2]
         z_prev2 = points[ordered_idxs[i_pos-2], 2]
-        
         dh = delta_h_arr[i_pos]
-        
-        # Approach condition: positive height differences exceeding threshold
         return (z_prev1 - z_cur) > dh and (z_prev2 - z_cur) > dh
 
     def _is_departure_point(self, ordered_idxs, points, delta_h_arr, j_pos):
-        """NEW: Check if current point is a departure point"""
-        if j_pos >= len(ordered_idxs) - 1:  # Need at least 1 next point
+        if j_pos >= len(ordered_idxs) - 1:
             return False
-            
-        j_global = ordered_idxs[j_pos]
-        z_j = points[j_global, 2]
+        z_j = points[ordered_idxs[j_pos], 2]
         z_next1 = points[ordered_idxs[j_pos+1], 2]
-        
         dh = delta_h_arr[j_pos]
-        
-        # Departure condition: negative height difference below threshold
         return (z_next1 - z_j) < 0 and abs(z_next1 - z_j) < dh
 
     def _find_object_chain(self, ordered_idxs, points, delta_h_arr, special_mask, start_pos):
-        """NEW: Find complete object chain from approach to departure point"""
         N = len(ordered_idxs)
         object_chain = []
-        
-        # Find approach point
         approach_pos = -1
-        for i_pos in range(start_pos, min(start_pos + 10, N - 2)):  # Search window
+        for i_pos in range(start_pos, min(start_pos + 10, N - 2)):
             if not special_mask[ordered_idxs[i_pos]]:
                 continue
-                
             if self._is_approach_point(ordered_idxs, points, delta_h_arr, i_pos):
                 approach_pos = i_pos
                 object_chain.append(ordered_idxs[i_pos])
                 break
-        
         if approach_pos == -1:
-            return [], start_pos + 1  # No approach point found
-            
-        # Find departure point and interior points
+            return [], start_pos + 1
         departure_pos = -1
-        for j_pos in range(approach_pos + 1, min(approach_pos + 20, N - 1)):  # Search window
+        for j_pos in range(approach_pos + 1, min(approach_pos + 20, N - 1)):
             if not special_mask[ordered_idxs[j_pos]]:
-                # Still add as interior point even if not special
                 object_chain.append(ordered_idxs[j_pos])
                 continue
-                
             if self._is_departure_point(ordered_idxs, points, delta_h_arr, j_pos):
                 departure_pos = j_pos
                 object_chain.append(ordered_idxs[j_pos])
                 break
             else:
                 object_chain.append(ordered_idxs[j_pos])
-        
-        # If no departure found, use limited chain
         if departure_pos == -1:
-            departure_pos = min(approach_pos + 5, N - 1)  # Limit chain length
+            departure_pos = min(approach_pos + 5, N - 1)
             for k in range(approach_pos + 1, departure_pos + 1):
                 if k < N:
                     object_chain.append(ordered_idxs[k])
-        
         return object_chain, departure_pos + 1
 
     def _coarse_object_filtering(self, points):
-        """IMPROVED: Now with complete object chain detection"""
         xy = points[:, :2]
         r, _ = self._cart_to_polar(xy)
         special_mask = self._heuristic_special_point_filter(points)
@@ -239,39 +216,28 @@ class LidarClusterNode:
         theta = np.arctan2(points[:,1], points[:,0])
         theta_bins = np.round(theta / (np.deg2rad(0.5))).astype(int)
         unique_bins = np.unique(theta_bins)
-        
         for b in unique_bins:
             idxs = np.nonzero(theta_bins == b)[0]
             if idxs.size < 4:
                 continue
-                
             r_sub = r[idxs]
             order = np.argsort(r_sub)
             ordered_idxs = idxs[order]
             dists = r[ordered_idxs]
             delta_h_arr = self._adaptive_delta_h(dists)
-            
-            # NEW: Complete object chain detection
             pos = 0
             while pos < len(ordered_idxs) - 3:
                 object_chain, next_pos = self._find_object_chain(
                     ordered_idxs, points, delta_h_arr, special_mask, pos
                 )
-                
-                # Mark all points in the chain as object points
                 for idx in object_chain:
                     removed_mask[idx] = True
-                
                 pos = next_pos
-                
-                # Safety break
                 if pos >= len(ordered_idxs):
                     break
-
         return removed_mask
 
     def _select_seed_points_double_threshold(self, points, grid_to_points):
-        """EXISTING FUNCTION - UNCHANGED"""
         N = points.shape[0]
         is_seed = np.zeros(N, dtype=bool)
         if N == 0:
@@ -303,7 +269,6 @@ class LidarClusterNode:
         return is_seed
 
     def _fit_plane_to_points(self, pts):
-        """EXISTING FUNCTION - UNCHANGED"""
         if pts.shape[0] < 3:
             return None, None
         X = np.c_[pts[:,0], pts[:,1], np.ones(pts.shape[0])]
@@ -319,7 +284,6 @@ class LidarClusterNode:
             return None, None
 
     def _multi_region_ground_segmentation(self, points):
-        """EXISTING FUNCTION - UNCHANGED"""
         N = points.shape[0]
         if N == 0:
             return np.zeros(0, dtype=bool)
@@ -425,17 +389,15 @@ class LidarClusterNode:
         return ground_mask_final
 
     # -----------------------------
-    # Improved clustering: adaptive eps per point + improved core search + merging
+    # Clustering utilities (unchanged)
     # -----------------------------
     def _adaptive_eps_for_points(self, points):
-        """EXISTING FUNCTION - UNCHANGED"""
         Di = np.sqrt(points[:,0]**2 + points[:,1]**2)
         eps_vals = (self.lambda_eps * math.pi * self.delta_alpha * Di) / 180.0
         eps_vals = np.maximum(eps_vals, self.eps)
         return eps_vals
 
     def _improved_core_search(self, points, eps_array):
-        """EXISTING FUNCTION - UNCHANGED"""
         if points.shape[0] == 0:
             return np.zeros(0, dtype=bool), []
         tree = KDTree(points[:, :2])
@@ -456,7 +418,6 @@ class LidarClusterNode:
         return core_mask, neighbors
 
     def _form_and_merge_clusters(self, points, core_mask, neighbors):
-        """EXISTING FUNCTION - UNCHANGED"""
         N = points.shape[0]
         labels = -1 * np.ones(N, dtype=int)
         core_idxs = np.nonzero(core_mask)[0].tolist()
@@ -503,39 +464,28 @@ class LidarClusterNode:
     # OBB computation (PCA-based) + quaternion helper
     # -----------------------------
     def _compute_obb_pca(self, pts):
-        """EXISTING FUNCTION - UNCHANGED"""
         if pts.shape[0] == 0:
             return None, None, None
-        # compute centroid
         centroid = np.mean(pts, axis=0)
-        # covariance of centered points
         centered = pts - centroid
         cov = np.cov(centered, rowvar=False, bias=True)
-        # eigen decomposition
-        eigvals, eigvecs = np.linalg.eigh(cov)  # ascending eigenvalues
-        # reorder to descending
+        eigvals, eigvecs = np.linalg.eigh(cov)  # ascending
         order = np.argsort(eigvals)[::-1]
         eigvals = eigvals[order]
-        eigvecs = eigvecs[:, order]  # columns are principal axes
-        # Ensure right-handed coordinate system
+        eigvecs = eigvecs[:, order]
         if np.linalg.det(eigvecs) < 0:
             eigvecs[:,2] *= -1.0
-        # project points onto axes to get min/max extents
-        proj = np.dot(centered, eigvecs)  # Nx3 coordinates in PCA frame
+        proj = np.dot(centered, eigvecs)
         mins = np.min(proj, axis=0)
         maxs = np.max(proj, axis=0)
-        extents = maxs - mins  # lengths along principal axes
-        # center in PCA frame then convert back to world
+        extents = maxs - mins
         center_pca = (maxs + mins) / 2.0
         center_world = centroid + np.dot(center_pca, eigvecs.T)
-        # rotation matrix columns = eigvecs
         R = eigvecs
         quat = self._rotmat_to_quat(R)
         return center_world, extents, quat
 
     def _rotmat_to_quat(self, R):
-        """EXISTING FUNCTION - UNCHANGED"""
-        # Ensure R is numpy array
         R = np.array(R, dtype=float).reshape((3,3))
         trace = R[0,0] + R[1,1] + R[2,2]
         if trace > 0:
@@ -563,7 +513,6 @@ class LidarClusterNode:
                 x = (R[0,2] + R[2,0]) / s
                 y = (R[1,2] + R[2,1]) / s
                 z = 0.25 * s
-        # normalize quaternion
         q = np.array([x,y,z,w], dtype=float)
         q = q / (np.linalg.norm(q) + 1e-12)
         return q.tolist()
@@ -572,19 +521,18 @@ class LidarClusterNode:
     # Main callback
     # -----------------------------
     def callback(self, msg):
-        """EXISTING FUNCTION - UNCHANGED"""
+        # Read XYZ from /velodyne_points
         pts = []
         for p in pc2.read_points(msg, field_names=("x","y","z","intensity"), skip_nans=True):
-            x, y, z = p[0], p[1], p[2]
-            pts.append([x, y, z])
+            pts.append([p[0], p[1], p[2]])
         if len(pts) == 0:
             return
         data = np.array(pts, dtype=np.float32)
 
+        # Range, Z filters
         max_range = rospy.get_param("~max_range", 100.0)
         dists = np.linalg.norm(data, axis=1)
-        mask = dists < max_range
-        data = data[mask]
+        data = data[dists < max_range]
 
         z_min = rospy.get_param("~z_min", -4.0)
         z_max = rospy.get_param("~z_max", 4.0)
@@ -594,8 +542,7 @@ class LidarClusterNode:
         # Ground segmentation (paper-style)
         try:
             ground_mask_paper = self._multi_region_ground_segmentation(data)
-            removed_by_paper = np.sum(ground_mask_paper)
-            rospy.loginfo_throttle(3, f"Paper-segmentation: ground_points_found={removed_by_paper}")
+            rospy.loginfo_throttle(3, f"Paper-segmentation: ground_points_found={int(np.sum(ground_mask_paper))}")
             data_nonground = data[~ground_mask_paper]
         except Exception as e:
             rospy.logwarn(f"Paper-style ground segmentation failed: {e}")
@@ -611,11 +558,9 @@ class LidarClusterNode:
                 inlier_mask = ransac.inlier_mask_
                 plane_pred = ransac.predict(X)
                 plane_dist = np.abs(y - plane_pred)
-
                 D = 0.2
                 ground_mask = (plane_dist < D) & inlier_mask
-
-                rospy.loginfo_throttle(3, f"RANSAC: candidates={np.sum(inlier_mask)}, removed={np.sum(ground_mask)}")
+                rospy.loginfo_throttle(3, f"RANSAC: candidates={int(np.sum(inlier_mask))}, removed={int(np.sum(ground_mask))}")
                 data = data_nonground[~ground_mask]
             else:
                 data = data_nonground
@@ -637,17 +582,14 @@ class LidarClusterNode:
 
         final_labels = -1 * np.ones(data.shape[0], dtype=int)
         next_label = 0
-
         for pl in np.unique(pre_labels):
             idxs = np.where(pre_labels == pl)[0]
             sub_pts = data[idxs, :]
             if sub_pts.shape[0] < 3:
                 continue
-
             eps_array = self._adaptive_eps_for_points(sub_pts)
             core_mask_local, neighbors_local = self._improved_core_search(sub_pts, eps_array)
             local_labels = self._form_and_merge_clusters(sub_pts, core_mask_local, neighbors_local)
-
             unique_local = np.unique(local_labels)
             for ul in unique_local:
                 if ul == -1:
@@ -655,7 +597,6 @@ class LidarClusterNode:
                 mask_local = (local_labels == ul)
                 final_labels[idxs[mask_local]] = next_label
                 next_label += 1
-
             unassigned = np.where(final_labels[idxs] == -1)[0]
             if unassigned.size > 0:
                 try:
@@ -670,19 +611,36 @@ class LidarClusterNode:
                             next_label += 1
                 except Exception as e:
                     rospy.logwarn(f"Fallback DBSCAN failed in precluster {pl}: {e}")
-
         labels = final_labels
 
-        # Markers + OBB (PCA-based)
+        # ---- Build markers (with proper DELETE of stale) ----
+        frame_id = msg.header.frame_id if msg.header.frame_id else "velodyne"
+        stamp    = msg.header.stamp if msg.header.stamp else rospy.Time.now()
+
+        # First: delete all previous marker IDs (safe approach)
+        if self._prev_ids:
+            del_arr = MarkerArray()
+            for old_id in sorted(self._prev_ids):
+                dm = Marker()
+                dm.header.frame_id = frame_id
+                dm.header.stamp = stamp
+                dm.ns = self._marker_ns
+                dm.id = int(old_id)
+                dm.action = Marker.DELETE
+                del_arr.markers.append(dm)
+            self.marker_pub.publish(del_arr)
+            self._prev_ids.clear()
+
+        # Then: publish current markers
         marker_array = MarkerArray()
         centroids = []
         unique_labels = set(labels)
         marker_id = 0
+        rng = np.random.default_rng(12345)  # deterministic colors
 
         for label in unique_labels:
             if label == -1:
                 continue
-
             cluster_points = data[labels == label]
             if cluster_points.shape[0] < 3:
                 continue
@@ -690,66 +648,55 @@ class LidarClusterNode:
             centroid = np.mean(cluster_points, axis=0)
             centroids.append(centroid)
 
-            # Compute OBB via PCA
             center_world, extents, quat = self._compute_obb_pca(cluster_points)
+            m = Marker()
+            m.header.frame_id = frame_id
+            m.header.stamp = stamp
+            m.ns = self._marker_ns
+            m.id = marker_id
+            m.type = Marker.CUBE
+            m.action = Marker.ADD
+
             if center_world is None:
-                # fallback to AABB if PCA fails
                 x_min, y_min, z_min_v = np.min(cluster_points, axis=0)
                 x_max, y_max, z_max_v = np.max(cluster_points, axis=0)
                 pos = [(x_min + x_max)/2.0, (y_min + y_max)/2.0, (z_min_v + z_max_v)/2.0]
                 sx = max(0.001, (x_max - x_min))
                 sy = max(0.001, (y_max - y_min))
                 sz = max(0.001, (z_max_v - z_min_v))
-                m = Marker()
-                m.header.frame_id = msg.header.frame_id if msg.header.frame_id else "velodyne"
-                m.header.stamp = msg.header.stamp
-                m.ns = "lidar_boxes"
-                m.id = marker_id
-                m.type = Marker.CUBE
-                m.action = Marker.ADD
                 m.pose.position.x = float(pos[0]); m.pose.position.y = float(pos[1]); m.pose.position.z = float(pos[2])
                 m.pose.orientation.w = 1.0
                 m.scale.x = float(sx); m.scale.y = float(sy); m.scale.z = float(sz)
             else:
-                # Use oriented box
-                m = Marker()
-                m.header.frame_id = msg.header.frame_id if msg.header.frame_id else "velodyne"
-                m.header.stamp = msg.header.stamp
-                m.ns = "lidar_boxes_obb"
-                m.id = marker_id
-                m.type = Marker.CUBE
-                m.action = Marker.ADD
                 m.pose.position.x = float(center_world[0])
                 m.pose.position.y = float(center_world[1])
                 m.pose.position.z = float(center_world[2])
-                # quaternion from PCA rotation
                 m.pose.orientation.x = float(quat[0])
                 m.pose.orientation.y = float(quat[1])
                 m.pose.orientation.z = float(quat[2])
                 m.pose.orientation.w = float(quat[3])
-                # extents are lengths along PCA axes
                 sx = float(max(0.001, extents[0]))
                 sy = float(max(0.001, extents[1]))
                 sz = float(max(0.001, extents[2]))
-                m.scale.x = sx
-                m.scale.y = sy
-                m.scale.z = sz
+                m.scale.x = sx; m.scale.y = sy; m.scale.z = sz
 
-            np.random.seed(label + 12345)
-            color = np.random.rand(3)
+            color = rng.random(3)
             m.color.r = float(color[0])
             m.color.g = float(color[1])
             m.color.b = float(color[2])
             m.color.a = 0.5
 
             marker_array.markers.append(m)
+            self._prev_ids.add(marker_id)
             marker_id += 1
 
         self.marker_pub.publish(marker_array)
 
+        # ---- Publish centroids with the SAME stamp/frame as boxes ----
         hdr = Header()
-        hdr.stamp = rospy.Time.now()
+        hdr.stamp = msg.header.stamp    # was: rospy.Time.now()
         hdr.frame_id = msg.header.frame_id if msg.header.frame_id else "velodyne"
+
         if len(centroids) > 0:
             pc2_cent = make_pc2_from_xyz(hdr, np.array(centroids))
             self.cent_pub.publish(pc2_cent)
@@ -762,7 +709,6 @@ class LidarClusterNode:
             empty.is_dense = True
             empty.data = b''
             self.cent_pub.publish(empty)
-
 
 if __name__ == "__main__":
     node = LidarClusterNode()
