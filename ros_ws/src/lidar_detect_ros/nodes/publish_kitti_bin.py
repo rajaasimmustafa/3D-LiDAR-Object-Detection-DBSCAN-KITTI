@@ -5,6 +5,17 @@ import rospy
 from std_msgs.msg import Header
 from sensor_msgs.msg import PointCloud2, PointField
 
+def _parse_bool(x, default=False):
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, (int, float)):
+        return bool(x)
+    if isinstance(x, str):
+        s = x.strip().lower()
+        if s in ("true","1","yes","y","on"):  return True
+        if s in ("false","0","no","n","off"): return False
+    return default
+
 def read_bin(path):
     scan = np.fromfile(path, dtype=np.float32)
     if scan.size % 4 != 0:
@@ -36,26 +47,33 @@ def create_cloud_xyz_ir(header, points):
 
 def publish_file(file_path, pub, frame_id="velodyne"):
     pts = read_bin(file_path)
-    header = Header(stamp=rospy.Time.now(), frame_id=frame_id)
+    header = Header(stamp=rospy.Time.now(), frame_id=frame_id)  # consistent stamp
     pc2_msg = create_cloud_xyz_ir(header, pts)
     pub.publish(pc2_msg)
     rospy.loginfo("Published %d points from %s", pts.shape[0], os.path.basename(file_path))
 
 if __name__ == "__main__":
     rospy.init_node("kitti_bin_publisher", anonymous=True)
-
-    # --- Robust argument/param handling ---
-    # Prefer ROS params; fall back to argv (but ignore ROS extras like __name:=...)
     args = rospy.myargv(argv=sys.argv)
 
-    data_dir  = rospy.get_param("~data_dir", None)     # folder of .bin
-    file_path = rospy.get_param("~file_path", None)    # single .bin
+    data_dir  = rospy.get_param("~data_dir", None)
+    file_path = rospy.get_param("~file_path", None)
+    if file_path:
+        file_path = os.path.expanduser(file_path)
+    if data_dir:
+        data_dir = os.path.expanduser(data_dir)
+
     rate_hz   = float(rospy.get_param("~rate_hz", 1.0))
-    loop_play = bool(rospy.get_param("~loop", False))
+    loop_raw  = rospy.get_param("~loop", False)
+    loop_play = loop_raw if isinstance(loop_raw, bool) else str(loop_raw).strip().lower() in ("1","true","yes","y")
     frame_id  = rospy.get_param("~frame_id", "velodyne")
     topic     = rospy.get_param("~topic", "/velodyne_points")
 
-    # Backward-compat: allow argv[1] as file or dir if params not given
+
+    # expanduser even for rosparams
+    if data_dir:  data_dir  = os.path.expanduser(data_dir)
+    if file_path: file_path = os.path.expanduser(file_path)
+
     if (not data_dir and not file_path) and len(args) > 1:
         cand = os.path.expanduser(args[1])
         if os.path.isdir(cand):
@@ -73,19 +91,15 @@ if __name__ == "__main__":
     try:
         if file_path:
             if not os.path.isfile(file_path):
-                rospy.logfatal("File not found: %s", file_path)
-                sys.exit(1)
-            # publish single frame once
+                rospy.logfatal("File not found: %s", file_path); sys.exit(1)
             rospy.sleep(0.3)
             publish_file(file_path, pub, frame_id)
             rospy.loginfo("Single frame published. Exiting.")
         else:
-            # directory mode: stream all .bin files
             pattern = os.path.join(os.path.expanduser(data_dir), "*.bin")
             files = sorted(glob.glob(pattern))
             if not files:
-                rospy.logfatal("No .bin files under: %s", data_dir)
-                sys.exit(1)
+                rospy.logfatal("No .bin files under: %s", data_dir); sys.exit(1)
 
             rospy.loginfo("Streaming %d frames from %s at %.2f Hz (loop=%s)",
                           len(files), data_dir, rate_hz, str(loop_play))
@@ -97,6 +111,5 @@ if __name__ == "__main__":
                 if not loop_play:
                     rospy.loginfo("Done streaming all frames.")
                     break
-
     except rospy.ROSInterruptException:
         pass
