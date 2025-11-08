@@ -159,22 +159,22 @@ class LidarClusterNode:
     def _adaptive_delta_h(self, distances):
         return self.alpha_h_a * distances + self.alpha_h_b
 
-    def _is_approach_point(self, ordered_idxs, points, delta_h_arr, i_pos):
+    def _is_approach_point(ordered_idxs, points, delta_h_arr, i_pos):
         if i_pos < 2:
             return False
         z_cur = points[ordered_idxs[i_pos], 2]
         z_prev1 = points[ordered_idxs[i_pos-1], 2]
         z_prev2 = points[ordered_idxs[i_pos-2], 2]
         dh = delta_h_arr[i_pos]
-        return (z_prev1 - z_cur) > dh and (z_prev2 - z_cur) > dh
+        return (z_cur - z_prev1) > dh and (z_cur - z_prev2) > dh
 
-    def _is_departure_point(self, ordered_idxs, points, delta_h_arr, j_pos):
+    def _is_departure_point(ordered_idxs, points, delta_h_arr, j_pos):
         if j_pos >= len(ordered_idxs) - 1:
             return False
         z_j = points[ordered_idxs[j_pos], 2]
         z_next1 = points[ordered_idxs[j_pos+1], 2]
         dh = delta_h_arr[j_pos]
-        return (z_next1 - z_j) < 0 and abs(z_next1 - z_j) < dh
+        return (z_next - z_j) < -dh
 
     def _find_object_chain(self, ordered_idxs, points, delta_h_arr, special_mask, start_pos):
         N = len(ordered_idxs)
@@ -237,32 +237,21 @@ class LidarClusterNode:
                     break
         return removed_mask
 
-    def _select_seed_points_double_threshold(self, points, grid_to_points):
+    def _select_seed_points_double_threshold(points, grid_to_points):
         N = points.shape[0]
         is_seed = np.zeros(N, dtype=bool)
         if N == 0:
             return is_seed
-        global_avg = np.mean(points[:,2])
+        global_thr = np.percentile(points[:,2], 15.0)
         for gid, idx_list in grid_to_points.items():
-            if len(idx_list) == 0:
+            if not idx_list:
                 continue
-            idxs = np.array(idx_list, dtype=int)
-            local_avg = np.mean(points[idxs,2])
-            thresh = min(local_avg, global_avg)
-            is_seed[idxs[points[idxs,2] <= thresh]] = True
-        for _ in range(self.seed_iter_max - 1):
-            new_seed = np.zeros_like(is_seed)
-            for gid, idx_list in grid_to_points.items():
-                if len(idx_list) == 0:
-                    continue
-                idxs = np.array(idx_list, dtype=int)
-                seed_idxs = idxs[is_seed[idxs]]
-                if seed_idxs.size == 0:
-                    local_avg = np.mean(points[idxs,2])
-                else:
-                    local_avg = np.mean(points[seed_idxs,2])
-                thresh = min(local_avg, global_avg)
-                new_seed[idxs[points[idxs,2] <= thresh]] = True
+            idxs = np.asarray(idx_list, dtype=int)
+            seed_idxs = idxs[is_seed[idxs]]
+            z_ref = points[seed_idxs, 2] if seed_idxs.size else points[idxs, 2]
+            local_thr = np.median(z_ref)
+            thr = min(local_thr, global_thr)
+            new_seed[idxs[points[idxs,2] <= thr]] = True
             if np.array_equal(new_seed, is_seed):
                 break
             is_seed = new_seed
@@ -382,7 +371,8 @@ class LidarClusterNode:
             z_pred = a * pts[:,0] + b * pts[:,1] + c
             dists = np.abs(pts[:,2] - z_pred)
             for ii, idx_glob in enumerate(idxs):
-                if dists[ii] < self.plane_dist_thresh:
+                thr = self._range_adaptive_plane_thresh(np.linalg.norm(pts[ii, :2]))
+                if dists[ii] < thr:
                     ground_mask[idx_glob] = True
 
         ground_mask_final = ground_mask & (~coarse_removed_mask)
@@ -391,6 +381,34 @@ class LidarClusterNode:
     # -----------------------------
     # Clustering utilities (unchanged)
     # -----------------------------
+    def _range_bin(self, r):
+        # near/mid/far bins (meters) – simple, tunable
+        if r < 15.0:
+            return "near"
+        if r < 35.0:
+            return "mid"
+        return "far"
+
+    def _min_samples_by_range(self, r):
+        b = self._range_bin(r)
+        return {
+            "near": max(5, self.min_samples),
+            "mid":  max(4, self.min_samples - 1),
+            "far":  max(2, self.min_samples - 3),
+        }[b]
+
+    def _eps_scale_by_range(self, r):
+        # far pe eps thora ↑, near pe ~1.0 (paper spirit)
+        b = self._range_bin(r)
+        return {"near": 1.00, "mid": 1.15, "far": 1.30}[b]
+
+    def _range_adaptive_plane_thresh(self, r):
+        # ground plane dist thresh: near chhota, far thora bara
+        base = float(self.plane_dist_thresh)  # e.g., 0.2
+        b = self._range_bin(r)
+        mul = {"near": 0.7, "mid": 1.0, "far": 1.3}[b]
+        return base * mul
+
     def _adaptive_eps_for_points(self, points):
         Di = np.sqrt(points[:,0]**2 + points[:,1]**2)
         eps_vals = (self.lambda_eps * math.pi * self.delta_alpha * Di) / 180.0
@@ -402,17 +420,22 @@ class LidarClusterNode:
             return np.zeros(0, dtype=bool), []
         tree = KDTree(points[:, :2])
         neighbors = tree.query_radius(points[:, :2], r=eps_array, return_distance=False)
+
+        Di = np.linalg.norm(points[:, :2], axis=1)  # per-point range
         N = points.shape[0]
         removed = np.zeros(N, dtype=bool)
         core_indices = []
+
         for idx in range(N):
             if removed[idx]:
                 continue
+            min_s = self._min_samples_by_range(float(Di[idx]))
             nbrs = neighbors[idx]
-            if nbrs.shape[0] >= self.min_samples:
+            if nbrs.shape[0] >= min_s:
                 core_indices.append(idx)
                 for nb in nbrs:
                     removed[int(nb)] = True
+
         core_mask = np.zeros(N, dtype=bool)
         core_mask[core_indices] = True
         return core_mask, neighbors
@@ -461,29 +484,66 @@ class LidarClusterNode:
         return labels
 
     # -----------------------------
-    # OBB computation (PCA-based) + quaternion helper
+    # OBB computation (PCA-based) + quaternion helper (yaw-only BEV)
     # -----------------------------
+    @staticmethod
+    def _yaw_only_from_xy_cov(pts_xy: np.ndarray) -> float:
+        """XY PCA → principal direction → yaw (rad)."""
+        if pts_xy.shape[0] < 2:
+            return 0.0
+        c = np.mean(pts_xy, axis=0)
+        C = pts_xy - c
+        cov = np.cov(C, rowvar=False, bias=True)
+        eigvals, eigvecs = np.linalg.eigh(cov)   # ascending
+        v = eigvecs[:, int(np.argmax(eigvals))]  # principal dir in XY
+        return float(math.atan2(float(v[1]), float(v[0])))
+
     def _compute_obb_pca(self, pts):
+        """Yaw-only OBB (BEV): roll/pitch 0, sirf Z-axis rotation."""
         if pts.shape[0] == 0:
             return None, None, None
+
+        # Center
         centroid = np.mean(pts, axis=0)
-        centered = pts - centroid
-        cov = np.cov(centered, rowvar=False, bias=True)
-        eigvals, eigvecs = np.linalg.eigh(cov)  # ascending
-        order = np.argsort(eigvals)[::-1]
-        eigvals = eigvals[order]
-        eigvecs = eigvecs[:, order]
-        if np.linalg.det(eigvecs) < 0:
-            eigvecs[:,2] *= -1.0
-        proj = np.dot(centered, eigvecs)
-        mins = np.min(proj, axis=0)
-        maxs = np.max(proj, axis=0)
-        extents = maxs - mins
-        center_pca = (maxs + mins) / 2.0
-        center_world = centroid + np.dot(center_pca, eigvecs.T)
-        R = eigvecs
-        quat = self._rotmat_to_quat(R)
+
+        # --- BEV (XY) extents & yaw ---
+        pts_xy = pts[:, :2]
+        yaw = self._yaw_only_from_xy_cov(pts_xy)
+
+        # rotate XY points by -yaw to get axis-aligned box in local frame
+        c, s = math.cos(-yaw), math.sin(-yaw)
+        Rz = np.array([[c, -s],
+                       [s,  c]], dtype=float)
+        aligned_xy = (pts_xy - centroid[:2]) @ Rz.T
+
+        mins_xy = np.min(aligned_xy, axis=0)
+        maxs_xy = np.max(aligned_xy, axis=0)
+        sx = float(max(0.001, maxs_xy[0] - mins_xy[0]))
+        sy = float(max(0.001, maxs_xy[1] - mins_xy[1]))
+
+        # Z extents axis-aligned (no tilt)
+        z_min = float(np.min(pts[:, 2]))
+        z_max = float(np.max(pts[:, 2]))
+        sz = float(max(0.001, z_max - z_min))
+
+        # box center in world (XY from mid in local frame → rotate back)
+        mid_xy_local = 0.5 * (mins_xy + maxs_xy)
+        cw, sw = math.cos(yaw), math.sin(yaw)
+        Rw = np.array([[cw, -sw],
+                       [sw,  cw]], dtype=float)
+        center_xy_world = centroid[:2] + (mid_xy_local @ Rw.T)
+        center_world = np.array([center_xy_world[0],
+                                 center_xy_world[1],
+                                 0.5 * (z_min + z_max)], dtype=float)
+
+        # quaternion only about Z (yaw)
+        qw = math.cos(0.5 * yaw)
+        qz = math.sin(0.5 * yaw)
+        quat = [0.0, 0.0, float(qz), float(qw)]
+
+        extents = np.array([sx, sy, sz], dtype=float)
         return center_world, extents, quat
+
 
     def _rotmat_to_quat(self, R):
         R = np.array(R, dtype=float).reshape((3,3))
@@ -539,37 +599,52 @@ class LidarClusterNode:
         zmask = (data[:, 2] > z_min) & (data[:, 2] < z_max)
         data = data[zmask]
 
-        # Ground segmentation (paper-style)
+        # Ground segmentation (paper-style) + sanity
         try:
             ground_mask_paper = self._multi_region_ground_segmentation(data)
-            rospy.loginfo_throttle(3, f"Paper-segmentation: ground_points_found={int(np.sum(ground_mask_paper))}")
+            g_cnt = int(np.sum(ground_mask_paper))
+            N = data.shape[0]
+            g_ratio = (g_cnt / max(N, 1))
+            rospy.loginfo_throttle(3, f"Paper-segmentation: ground_points_found={g_cnt} ({g_ratio:.2f})")
             data_nonground = data[~ground_mask_paper]
         except Exception as e:
             rospy.logwarn(f"Paper-style ground segmentation failed: {e}")
+            ground_mask_paper = np.zeros(data.shape[0], dtype=bool)
+            g_ratio = 0.0
             data_nonground = data.copy()
 
-        # RANSAC fallback
-        try:
-            X = data_nonground[:, :2]
-            y = data_nonground[:, 2]
-            if X.shape[0] >= 3:
-                ransac = RANSACRegressor(residual_threshold=0.2, max_trials=100)
-                ransac.fit(X, y)
-                inlier_mask = ransac.inlier_mask_
-                plane_pred = ransac.predict(X)
-                plane_dist = np.abs(y - plane_pred)
-                D = 0.2
-                ground_mask = (plane_dist < D) & inlier_mask
-                rospy.loginfo_throttle(3, f"RANSAC: candidates={int(np.sum(inlier_mask))}, removed={int(np.sum(ground_mask))}")
-                data = data_nonground[~ground_mask]
-            else:
+        # RANSAC = TRUE FALLBACK ONLY (jab paper-seg weird lage)
+        need_ransac = (g_ratio < 0.05) or (g_ratio > 0.80)  # tunable sanity range
+        if need_ransac:
+            try:
+                X = data_nonground[:, :2]
+                y = data_nonground[:, 2]
+                if X.shape[0] >= 3:
+                    # range-adaptive threshold: near < far
+                    Di = np.linalg.norm(data_nonground[:, :2], axis=1)
+                    r_med = float(np.median(Di)) if Di.size else 20.0
+                    D = self._range_adaptive_plane_thresh(r_med)
+                    ransac = RANSACRegressor(residual_threshold=D, max_trials=100)
+                    ransac.fit(X, y)
+                    inlier_mask = ransac.inlier_mask_
+                    plane_pred = ransac.predict(X)
+                    plane_dist = np.abs(y - plane_pred)
+                    ground_mask = (plane_dist < D) & inlier_mask
+                    rospy.loginfo_throttle(3, f"RANSAC(fallback): D={D:.2f}, cand={int(np.sum(inlier_mask))}, removed={int(np.sum(ground_mask))}")
+                    data = data_nonground[~ground_mask]
+                else:
+                    data = data_nonground
+            except Exception as e:
+                rospy.logwarn(f"RANSAC fallback error: {e}")
                 data = data_nonground
-        except Exception as e:
-            rospy.logwarn(f"RANSAC ground removal skipped due to error: {e}")
+        else:
             data = data_nonground
+        
 
         # Pre-clustering + improved DBSCAN-like clustering
-        k_pre = self.k_pre_default if data.shape[0] > 100 else 1
+        # adaptive k_pre: zyada points → zyada buckets
+        N_pts = int(data.shape[0])
+        k_pre = max(1, min(self.k_pre_default, max(1, N_pts // 800)))
         if k_pre > 1:
             try:
                 kmeans = KMeans(n_clusters=k_pre, init='k-means++', random_state=42).fit(data)
@@ -587,9 +662,11 @@ class LidarClusterNode:
             sub_pts = data[idxs, :]
             if sub_pts.shape[0] < 3:
                 continue
+
             eps_array = self._adaptive_eps_for_points(sub_pts)
             core_mask_local, neighbors_local = self._improved_core_search(sub_pts, eps_array)
             local_labels = self._form_and_merge_clusters(sub_pts, core_mask_local, neighbors_local)
+
             unique_local = np.unique(local_labels)
             for ul in unique_local:
                 if ul == -1:
@@ -597,11 +674,18 @@ class LidarClusterNode:
                 mask_local = (local_labels == ul)
                 final_labels[idxs[mask_local]] = next_label
                 next_label += 1
+
             unassigned = np.where(final_labels[idxs] == -1)[0]
             if unassigned.size > 0:
                 try:
                     eps_use = max(self.eps, np.mean(eps_array))
-                    db = DBSCAN(eps=eps_use, min_samples=self.min_samples).fit(sub_pts[unassigned])
+                    # range-aware tweak
+                    Di_sub = np.linalg.norm(sub_pts[unassigned, :2], axis=1) if unassigned.size else np.array([])
+                    r_mean = float(np.mean(Di_sub)) if Di_sub.size else 20.0
+                    eps_use *= self._eps_scale_by_range(r_mean)
+                    min_s = self._min_samples_by_range(r_mean)
+
+                    db = DBSCAN(eps=eps_use, min_samples=min_s).fit(sub_pts[unassigned])
                     db_labels = db.labels_
                     for i_local, lbl in enumerate(db_labels):
                         if lbl == -1:
@@ -612,6 +696,7 @@ class LidarClusterNode:
                 except Exception as e:
                     rospy.logwarn(f"Fallback DBSCAN failed in precluster {pl}: {e}")
         labels = final_labels
+        
 
         # ---- Build markers (with proper DELETE of stale) ----
         frame_id = msg.header.frame_id if msg.header.frame_id else "velodyne"
@@ -642,9 +727,13 @@ class LidarClusterNode:
             if label == -1:
                 continue
             cluster_points = data[labels == label]
-            if cluster_points.shape[0] < 3:
-                continue
-
+            if cluster_points.shape[0] < 3: 
+               # far range pe tiny clusters allow (2 pts bhi chalein)
+               if cluster_points.shape[0] == 0:
+                  continue
+               cR = float(np.linalg.norm(np.mean(cluster_points[:, :2], axis=0)))
+               if not (cR >= 35.0 and cluster_points.shape[0] >= 2):
+                   continue
             centroid = np.mean(cluster_points, axis=0)
             centroids.append(centroid)
 
